@@ -1,0 +1,92 @@
+name: Publish website and remove editions older than seven days
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '10 17 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: pulse-public-pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Remove expired dated website folders
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from datetime import datetime,timedelta,date
+          from zoneinfo import ZoneInfo
+          import re,shutil,json
+          root=Path('.')
+          today=datetime.now(ZoneInfo('Asia/Ho_Chi_Minh')).date()
+          cutoff=today-timedelta(days=6)
+          expired=[]
+          for p in root.iterdir():
+              if p.is_dir() and re.fullmatch(r'\d{4}-\d{2}-\d{2}',p.name) and (p/'index.html').is_file() and date.fromisoformat(p.name)<cutoff:
+                  expired.append(p.name)
+                  shutil.rmtree(p)
+          for p in root.rglob('*.html'):
+              if '.git' in p.parts: continue
+              text=p.read_text()
+              for day in expired:
+                  text=re.sub(r'<li><a href="(?:\.\./)?'+re.escape(day)+r'/">.*?</a></li>','',text,flags=re.S)
+              p.write_text(text)
+          kept=sorted(p for p in root.iterdir() if p.is_dir() and re.fullmatch(r'\d{4}-\d{2}-\d{2}',p.name) and (p/'index.html').is_file() and cutoff<=date.fromisoformat(p.name)<=today)
+          if kept:
+              latest=kept[-1]
+              page=(latest/'index.html').read_text().replace('href="../assets/','href="assets/').replace('src="../assets/','src="assets/').replace('href="../index.html"','href="index.html"').replace('href="../archive.html"','href="archive.html"')
+              page=re.sub(r'src="(story-\d\.jpg[^\"]*)"',lambda m:'src="'+latest.name+'/'+m[1]+'"',page)
+              page=re.sub(r'href="\.\./(\d{4}-\d{2}-\d{2}/)"',r'href="\1"',page)
+              (root/'index.html').write_text(page)
+              (root/'share.json').write_text((latest/'share.json').read_text())
+          else:
+              page='<!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>THE MORNING PULSE</title><body><h1>THE MORNING PULSE</h1><p>Hiện chưa có số báo nào trong 7 ngày gần nhất.</p></body></html>'
+              (root/'index.html').write_text(page)
+              (root/'archive.html').write_text(page)
+              (root/'share.json').write_text(json.dumps({'url':'https://trihm77.github.io/morning-pulse/','image':None,'title':'THE MORNING PULSE'}))
+          PY
+      - name: Save retention changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'Remove editions outside the seven-day website window'
+            git push
+          fi
+      - name: Package only public website files
+        run: |
+          mkdir -p /tmp/pulse-site
+          rsync -a --exclude='.git' --exclude='.github' --exclude='README.md' ./ /tmp/pulse-site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: /tmp/pulse-site
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Wait for artifact metadata
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const name = `github-pages-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`;
+            for (let attempt = 0; attempt < 12; attempt++) {
+              const {data} = await github.rest.actions.listWorkflowRunArtifacts({...context.repo, run_id: context.runId, name});
+              if (data.artifacts.filter(a => a.name === name).length === 1) return;
+              await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+            throw new Error(`Artifact metadata unavailable: ${name}`);
+      - uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+        id: deployment
